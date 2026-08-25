@@ -632,16 +632,14 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 	meta, err := torrent.Load(torrentData)
 	if err != nil {
 		e.log.Error("BT torrent parse failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitTorrentParseError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitTorrentParseError, err.Error())
 		return err
 	}
 
 	infoHash, err := meta.InfoHash()
 	if err != nil {
 		e.log.Error("BT infohash compute failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitTorrentParseError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitTorrentParseError, err.Error())
 		return err
 	}
 	rg.btInfoHash = fmt.Sprintf("%x", infoHash[:])
@@ -687,8 +685,7 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 				e.log.Error("BT collision detected but auto-file-renaming is disabled", "gid", rg.gid, "path", targetPath)
 				e.queuesMu.Unlock()
 				if _, ok := e.groups.getLocked(rg.gid); ok {
-					rg.errCode = core.ExitFileAlreadyExists
-					rg.errMsg = fmt.Sprintf("file/directory already exists: %s", targetPath)
+					rg.setError(core.ExitFileAlreadyExists, fmt.Sprintf("file/directory already exists: %s", targetPath))
 					e.groups.unlock(rg.gid)
 				}
 				return fmt.Errorf("file/directory already exists: %s", targetPath)
@@ -729,8 +726,7 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 		files, pieceFilter, unselected, fileErr := torrentFilesToDiskEntriesWithOptions(filepath.Base(basePath), meta.Info.Files, rg.opts, meta.Info.PieceLength, meta.NumPieces())
 		if fileErr != nil {
 			e.log.Error("BT file option setup failed", "gid", rg.gid, "error", fileErr)
-			rg.errCode = core.ExitBadOption
-			rg.errMsg = fileErr.Error()
+			rg.setError(core.ExitBadOption, fileErr.Error())
 			return fileErr
 		}
 		wantedPieces = pieceFilter
@@ -741,8 +737,7 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 		mf, aErr := disk.NewMultiFile(dir, files, meta.Info.PieceLength, alloc)
 		if aErr != nil {
 			e.log.Error("BT disk setup failed", "gid", rg.gid, "error", aErr)
-			rg.errCode = core.ExitFileCreateError
-			rg.errMsg = aErr.Error()
+			rg.setError(core.ExitFileCreateError, aErr.Error())
 			return aErr
 		}
 		adaptor = mf
@@ -750,16 +745,14 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 		if rg.opts.AllowOverwrite && !rg.opts.Continue && !e.controlLoaded(rg) {
 			if truncErr := os.Truncate(outPath, 0); truncErr != nil && !os.IsNotExist(truncErr) {
 				e.log.Error("BT disk truncate failed", "gid", rg.gid, "error", truncErr)
-				rg.errCode = core.ExitFileIOError
-				rg.errMsg = truncErr.Error()
+				rg.setError(core.ExitFileIOError, truncErr.Error())
 				return truncErr
 			}
 		}
 		sf, aErr := disk.NewSingleFile(outPath, meta.Info.Length, alloc)
 		if aErr != nil {
 			e.log.Error("BT disk setup failed", "gid", rg.gid, "error", aErr)
-			rg.errCode = core.ExitFileCreateError
-			rg.errMsg = aErr.Error()
+			rg.setError(core.ExitFileCreateError, aErr.Error())
 			return aErr
 		}
 		rg.statusMu.Lock()
@@ -775,8 +768,7 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 
 	if err := adaptor.OpenForWrite(); err != nil {
 		e.log.Error("BT disk open failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitFileCreateError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileCreateError, err.Error())
 		adaptor.Close()
 		return err
 	}
@@ -815,8 +807,7 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 	inboundReg, err := e.btSession.Register(peerCfg)
 	if err != nil {
 		e.log.Error("BT inbound registration failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitNetworkProblem
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitNetworkProblem, err.Error())
 		return err
 	}
 
@@ -916,8 +907,7 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 			stopDiscovery()
 			discoveryWG.Wait()
 			e.log.Error("BT no peers available", "gid", rg.gid)
-			rg.errCode = core.ExitResourceNotFound
-			rg.errMsg = peerErr.Error()
+			rg.setError(core.ExitResourceNotFound, peerErr.Error())
 			return peerErr
 		}
 		swarm.addPeer(initialPeer)
@@ -944,8 +934,7 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 		e.log.Info("BT verifying pieces", "gid", rg.gid)
 		if err := verifySelectedPieces(ctx, adaptor, meta, wantedPieces); err != nil {
 			e.log.Error("BT verification failed", "gid", rg.gid, "error", err)
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = fmt.Sprintf("piece verification failed: %v", err)
+			rg.setError(core.ExitFileIOError, fmt.Sprintf("piece verification failed: %v", err))
 			return err
 		}
 	}
@@ -1132,8 +1121,7 @@ func (s *btSwarm) downloadWebSeeds(ctx context.Context, rg *requestGroup, e *Eng
 		default:
 		}
 		if err := s.downloadWebSeedPiece(ctx, rg, e, pieceIdx, files); err != nil {
-			rg.errCode = protocolErrorCode(err)
-			rg.errMsg = err.Error()
+			rg.setError(protocolErrorCode(err), err.Error())
 			return err
 		}
 	}

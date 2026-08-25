@@ -68,8 +68,7 @@ func (e *Engine) shouldFollowTorrent(rg *requestGroup, uri string) bool {
 func (e *Engine) runTorrentFollowDownload(ctx context.Context, rg *requestGroup, uri, outPath string) {
 	driver, err := e.httpDriverForURI(rg, uri)
 	if err != nil {
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = err.Error()
+		rg.setError(protocolErrorCode(err), err.Error())
 		return
 	}
 
@@ -77,41 +76,35 @@ func (e *Engine) runTorrentFollowDownload(ctx context.Context, rg *requestGroup,
 	resp, err := e.downloadHTTPWithRetry(ctx, rg, driver, uri, 0, rg.probedSize, requestOpts)
 	if err != nil {
 		e.log.Error("torrent metadata download failed", "gid", rg.gid, "uri", uri, "error", err)
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = err.Error()
+		rg.setError(protocolErrorCode(err), err.Error())
 		return
 	}
 	if err := e.applyHTTPResponseDigests(rg, resp.Digests); err != nil {
 		resp.Body.Close()
-		rg.errCode = core.ExitChecksumError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitChecksumError, err.Error())
 		return
 	}
 	data, readErr := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if readErr != nil {
-		rg.errCode = core.ExitFileIOError
-		rg.errMsg = readErr.Error()
+		rg.setError(core.ExitFileIOError, readErr.Error())
 		return
 	}
 
 	if _, err := torrent.Load(data); err != nil {
-		rg.errCode = core.ExitTorrentParseError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitTorrentParseError, err.Error())
 		return
 	}
 
 	if rg.opts.FollowTorrent != "mem" {
 		if dir := filepath.Dir(outPath); dir != "" {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
-				rg.errCode = core.ExitDirCreateError
-				rg.errMsg = err.Error()
+				rg.setError(core.ExitDirCreateError, err.Error())
 				return
 			}
 		}
 		if err := os.WriteFile(outPath, data, 0o644); err != nil {
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = err.Error()
+			rg.setError(core.ExitFileIOError, err.Error())
 			return
 		}
 	}
@@ -128,8 +121,7 @@ func (e *Engine) runTorrentFollowDownload(ctx context.Context, rg *requestGroup,
 		BelongsTo: rg.gid,
 	})
 	if err != nil {
-		rg.errCode = core.ExitUnknownError
-		rg.errMsg = fmt.Sprintf("follow torrent: %s", err)
+		rg.setError(core.ExitUnknownError, fmt.Sprintf("follow torrent: %s", err))
 		return
 	}
 
@@ -145,10 +137,8 @@ func (e *Engine) runTorrentFollowDownload(ctx context.Context, rg *requestGroup,
 
 	rg.statusMu.Lock()
 	rg.totalLength = int64(len(data))
-	rg.statusMu.Unlock()
-	rg.statusMu.Lock()
 	rg.completedLength = int64(len(data))
-	rg.statusMu.Unlock()
 	rg.errCode = core.ExitSuccess
+	rg.statusMu.Unlock()
 	e.log.Info("torrent followed", "gid", rg.gid, "child", childGID, "size", len(data))
 }

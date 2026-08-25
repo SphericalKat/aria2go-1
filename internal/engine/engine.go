@@ -3535,7 +3535,9 @@ func (e *Engine) runDownload(rg *requestGroup) {
 	if e.cfg.DryRun || rg.opts.DryRun {
 		e.log.Info("dry-run mode, skipping download", "gid", rg.gid)
 		if _, ok := e.groups.getLocked(rg.gid); ok {
+			rg.statusMu.Lock()
 			rg.errCode = core.ExitSuccess
+			rg.statusMu.Unlock()
 			e.groups.unlock(rg.gid)
 		}
 		rg.cancel()
@@ -3558,8 +3560,7 @@ func (e *Engine) runDownload(rg *requestGroup) {
 
 	if len(rg.uris) == 0 {
 		e.log.Error("download has no URIs", "gid", rg.gid)
-		rg.errCode = core.ExitResourceNotFound
-		rg.errMsg = "no URIs specified"
+		rg.setError(core.ExitResourceNotFound, "no URIs specified")
 		rg.cancel()
 		return
 	}
@@ -3589,8 +3590,7 @@ func (e *Engine) runDownload(rg *requestGroup) {
 	u, err := url.Parse(uri)
 	if err != nil {
 		e.log.Error("cannot parse URI", "gid", rg.gid, "uri", uri, "error", err)
-		rg.errCode = core.ExitResourceNotFound
-		rg.errMsg = fmt.Sprintf("invalid URI: %s", uri)
+		rg.setError(core.ExitResourceNotFound, fmt.Sprintf("invalid URI: %s", uri))
 		rg.cancel()
 		return
 	}
@@ -3654,8 +3654,7 @@ func (e *Engine) runDownload(rg *requestGroup) {
 		e.runSFTPDownload(ctx, rg, uri, u, outPath)
 	default:
 		e.log.Error("unsupported protocol", "gid", rg.gid, "protocol", proto)
-		rg.errCode = core.ExitResourceNotFound
-		rg.errMsg = fmt.Sprintf("unsupported protocol: %s", proto)
+		rg.setError(core.ExitResourceNotFound, fmt.Sprintf("unsupported protocol: %s", proto))
 		rg.cancel()
 		return
 	}
@@ -3687,8 +3686,7 @@ func (e *Engine) resolveFileCollision(rg *requestGroup, outPath string, expected
 			if !rg.opts.AutoFileRenaming {
 				e.log.Error("file collision detected but auto-file-renaming is disabled", "gid", rg.gid, "path", outPath)
 				if _, ok := e.groups.getLocked(rg.gid); ok {
-					rg.errCode = core.ExitFileAlreadyExists
-					rg.errMsg = fmt.Sprintf("file already exists: %s", outPath)
+					rg.setError(core.ExitFileAlreadyExists, fmt.Sprintf("file already exists: %s", outPath))
 					e.groups.unlock(rg.gid)
 				}
 				return outPath, false
@@ -3714,21 +3712,18 @@ func (e *Engine) runMagnetDownload(ctx context.Context, rg *requestGroup, uri st
 	m, err := magnet.Parse(uri)
 	if err != nil {
 		e.log.Error("magnet parse failed", "gid", rg.gid, "error", err)
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = err.Error()
+		rg.setError(protocolErrorCode(err), err.Error())
 		return
 	}
 	if m.InfoHashV1 == nil {
-		rg.errCode = core.ExitMagnetParseError
-		rg.errMsg = "magnet link missing BitTorrent v1 info hash"
+		rg.setError(core.ExitMagnetParseError, "magnet link missing BitTorrent v1 info hash")
 		return
 	}
 
 	loaded, err := e.tryLoadSavedMagnetTorrent(ctx, rg, m)
 	if err != nil {
 		e.log.Error("magnet saved metadata load failed", "gid", rg.gid, "error", err)
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = protocolErrorMessage(err)
+		rg.setError(protocolErrorCode(err), protocolErrorMessage(err))
 		return
 	}
 	if loaded {
@@ -3737,16 +3732,14 @@ func (e *Engine) runMagnetDownload(ctx context.Context, rg *requestGroup, uri st
 
 	if err := e.runMagnetMetadataSession(ctx, rg, m); err != nil {
 		e.log.Error("magnet metadata download failed", "gid", rg.gid, "error", err)
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = protocolErrorMessage(err)
+		rg.setError(protocolErrorCode(err), protocolErrorMessage(err))
 	}
 }
 
 func (e *Engine) prepareHTTPMetadata(ctx context.Context, rg *requestGroup, uri, outPath string, outPathExplicit bool) (string, int64, bool) {
 	driver, err := e.httpDriverForURI(rg, uri)
 	if err != nil {
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = err.Error()
+		rg.setError(protocolErrorCode(err), err.Error())
 		return outPath, -1, false
 	}
 	info, err := e.probeHTTPInfoWithRetry(ctx, rg, driver, uri, outPath)
@@ -3756,13 +3749,11 @@ func (e *Engine) prepareHTTPMetadata(ctx context.Context, rg *requestGroup, uri,
 	}
 	if err != nil {
 		e.log.Error("HTTP probe failed", "gid", rg.gid, "uri", uri, "error", err)
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = err.Error()
+		rg.setError(protocolErrorCode(err), err.Error())
 		return outPath, -1, true
 	}
 	if err := e.applyHTTPResponseDigests(rg, info.Digests); err != nil {
-		rg.errCode = core.ExitChecksumError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitChecksumError, err.Error())
 		return outPath, -1, true
 	}
 
@@ -3973,8 +3964,7 @@ func (e *Engine) httpRequestOptions(rg *requestGroup, outPath string) httpproto.
 func (e *Engine) completeHTTPNotModified(rg *requestGroup, outPath string) {
 	st, err := os.Stat(outPath)
 	if err != nil {
-		rg.errCode = core.ExitFileIOError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileIOError, err.Error())
 		return
 	}
 	rg.filePath = outPath
@@ -3982,11 +3972,9 @@ func (e *Engine) completeHTTPNotModified(rg *requestGroup, outPath string) {
 	rg.filePathFromURI = false
 	rg.statusMu.Lock()
 	rg.totalLength = st.Size()
-	rg.statusMu.Unlock()
-	rg.statusMu.Lock()
 	rg.completedLength = st.Size()
-	rg.statusMu.Unlock()
 	rg.errCode = core.ExitSuccess
+	rg.statusMu.Unlock()
 	e.log.Info("HTTP resource not modified", "gid", rg.gid, "path", outPath)
 }
 
@@ -4091,12 +4079,10 @@ func (e *Engine) failHashCheckOnlyIncomplete(rg *requestGroup, outPath string) {
 		return
 	}
 	if err := ensureDownloadPlaceholder(outPath); err != nil {
-		rg.errCode = core.ExitFileCreateError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileCreateError, err.Error())
 		return
 	}
-	rg.errCode = core.ExitUnknownError
-	rg.errMsg = "download not complete"
+	rg.setError(core.ExitUnknownError, "download not complete")
 }
 
 func openHTTPScratchFile(outPath string) (*os.File, error) {
@@ -4173,15 +4159,13 @@ func (e *Engine) downloadToFile(ctx context.Context, rg *requestGroup, f *os.Fil
 			wn, writeErr := f.Write(buf[:n])
 			if writeErr != nil {
 				e.log.Error("disk write failed", "gid", rg.gid, "error", writeErr)
-				rg.errCode = core.ExitFileIOError
-				rg.errMsg = writeErr.Error()
+				rg.setError(core.ExitFileIOError, writeErr.Error())
 				return -1
 			}
 			written += int64(wn)
 			atomic.AddInt64(&rg.bytesDownloaded, int64(wn))
 			if err := guard.Add(wn); err != nil {
-				rg.errCode = core.ExitTooSlow
-				rg.errMsg = err.Error()
+				rg.setError(core.ExitTooSlow, err.Error())
 				return -1
 			}
 		}
@@ -4194,8 +4178,7 @@ func (e *Engine) downloadToFile(ctx context.Context, rg *requestGroup, f *os.Fil
 				return -1
 			}
 			e.log.Error("read failed", "gid", rg.gid, "error", readErr)
-			rg.errCode = protocolErrorCode(readErr)
-			rg.errMsg = readErr.Error()
+			rg.setError(protocolErrorCode(readErr), readErr.Error())
 			return -1
 		}
 	}
@@ -4206,8 +4189,7 @@ func (e *Engine) downloadToFile(ctx context.Context, rg *requestGroup, f *os.Fil
 func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, outPath string) {
 	driver, err := e.httpDriverForURI(rg, uri)
 	if err != nil {
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = err.Error()
+		rg.setError(protocolErrorCode(err), err.Error())
 		return
 	}
 	recordURI := uri
@@ -4237,13 +4219,11 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		}
 		if err != nil {
 			e.log.Error("HTTP probe failed", "gid", rg.gid, "uri", uri, "error", err)
-			rg.errCode = protocolErrorCode(err)
-			rg.errMsg = err.Error()
+			rg.setError(protocolErrorCode(err), err.Error())
 			return
 		}
 		if err := e.applyHTTPResponseDigests(rg, info.Digests); err != nil {
-			rg.errCode = core.ExitChecksumError
-			rg.errMsg = err.Error()
+			rg.setError(core.ExitChecksumError, err.Error())
 			return
 		}
 		size = info.Size
@@ -4258,8 +4238,6 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 
 	rg.statusMu.Lock()
 	rg.totalLength = size
-	rg.statusMu.Unlock()
-	rg.statusMu.Lock()
 	rg.lastSpeedSample = time.Now()
 	rg.statusMu.Unlock()
 	e.initControlInfo(rg, outPath, size, rg.integrity.controlPieceLength(0), nil)
@@ -4273,22 +4251,20 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 				if e.allowIntegrityRetry(rg) {
 					e.resetControlState(rg, outPath)
 					if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-						rg.errCode = core.ExitFileIOError
-						rg.errMsg = truncErr.Error()
+						rg.setError(core.ExitFileIOError, truncErr.Error())
 						return
 					}
 					existingSize = 0
 				} else {
-					rg.errCode = core.ExitChecksumError
-					rg.errMsg = verifyErr.Error()
+					rg.setError(core.ExitChecksumError, verifyErr.Error())
 					return
 				}
 			}
 			if existingSize >= size {
 				rg.statusMu.Lock()
 				rg.completedLength = size
-				rg.statusMu.Unlock()
 				rg.errCode = core.ExitSuccess
+				rg.statusMu.Unlock()
 				e.applyHTTPRemoteTime(rg, outPath, lastModified)
 				e.log.Info("download already complete", "gid", rg.gid, "size", size)
 				return
@@ -4302,30 +4278,27 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 					if e.allowIntegrityRetry(rg) {
 						e.resetControlState(rg, outPath)
 						if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-							rg.errCode = core.ExitFileIOError
-							rg.errMsg = truncErr.Error()
+							rg.setError(core.ExitFileIOError, truncErr.Error())
 							return
 						}
 						existingSize = 0
 					} else {
-						rg.errCode = core.ExitChecksumError
-						rg.errMsg = verifyErr.Error()
+						rg.setError(core.ExitChecksumError, verifyErr.Error())
 						return
 					}
 				}
 				if existingSize >= size {
 					rg.statusMu.Lock()
 					rg.completedLength = size
-					rg.statusMu.Unlock()
 					rg.errCode = core.ExitSuccess
+					rg.statusMu.Unlock()
 					e.applyHTTPRemoteTime(rg, outPath, lastModified)
 					e.log.Info("download already complete", "gid", rg.gid, "size", size)
 					return
 				}
 			}
 		} else if statErr != nil && !os.IsNotExist(statErr) {
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = statErr.Error()
+			rg.setError(core.ExitFileIOError, statErr.Error())
 			return
 		}
 	}
@@ -4335,8 +4308,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 	}
 	if rg.opts.AllowOverwrite && !rg.opts.Continue && !e.controlLoaded(rg) {
 		if err := os.Truncate(outPath, 0); err != nil && !os.IsNotExist(err) {
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = err.Error()
+			rg.setError(core.ExitFileIOError, err.Error())
 			return
 		}
 	}
@@ -4361,8 +4333,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		adaptor, err := disk.NewSingleFile(outPath, size, alloc)
 		if err != nil {
 			e.log.Error("cannot create output file", "gid", rg.gid, "path", outPath, "error", err)
-			rg.errCode = core.ExitFileCreateError
-			rg.errMsg = err.Error()
+			rg.setError(core.ExitFileCreateError, err.Error())
 			return
 		}
 		e.setControlAdaptor(rg, adaptor)
@@ -4391,11 +4362,12 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 					e.runHTTPDownload(ctx, rg, uri, outPath)
 					return
 				}
-				rg.errCode = core.ExitChecksumError
-				rg.errMsg = verifyErr.Error()
+				rg.setError(core.ExitChecksumError, verifyErr.Error())
 				return
 			}
+			rg.statusMu.Lock()
 			rg.errCode = core.ExitSuccess
+			rg.statusMu.Unlock()
 			e.applyHTTPRemoteTime(rg, outPath, lastModified)
 			e.log.Info("download already complete", "gid", rg.gid, "size", size)
 			return
@@ -4499,16 +4471,14 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			}
 			if errors.Is(firstErr, httpproto.ErrRangeIgnored) {
 				if rg.opts.AlwaysResume {
-					rg.errCode = core.ExitFileAlreadyExists
-					rg.errMsg = firstErr.Error()
+					rg.setError(core.ExitFileAlreadyExists, firstErr.Error())
 					return
 				}
 				sessionDownloaded := segMan.Written() + atomic.LoadInt64(&rg.bytesDownloaded)
 				if nextURI, restartScratch := e.nextHTTPResumeFallbackURI(rg, rangeIgnoredURI, sessionDownloaded); nextURI != "" {
 					recordURI = ""
 					if closeErr := adaptor.Close(); closeErr != nil {
-						rg.errCode = core.ExitFileIOError
-						rg.errMsg = closeErr.Error()
+						rg.setError(core.ExitFileIOError, closeErr.Error())
 						return
 					}
 					rg.statusMu.Lock()
@@ -4517,20 +4487,17 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 					e.runHTTPDownload(ctx, rg, nextURI, outPath)
 					return
 				} else if !restartScratch {
-					rg.errCode = protocolErrorCode(firstErr)
-					rg.errMsg = firstErr.Error()
+					rg.setError(protocolErrorCode(firstErr), firstErr.Error())
 					return
 				}
 				e.clearHTTPResumeFallbackURIs(rg)
 				e.log.Warn("HTTP server ignored resume range; restarting from scratch", "gid", rg.gid, "path", outPath)
 				if closeErr := adaptor.Close(); closeErr != nil {
-					rg.errCode = core.ExitFileIOError
-					rg.errMsg = closeErr.Error()
+					rg.setError(core.ExitFileIOError, closeErr.Error())
 					return
 				}
 				if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-					rg.errCode = core.ExitFileIOError
-					rg.errMsg = truncErr.Error()
+					rg.setError(core.ExitFileIOError, truncErr.Error())
 					return
 				}
 				oldContinue, oldSplit := rg.opts.Continue, rg.opts.Split
@@ -4541,15 +4508,13 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 				rg.opts.Continue, rg.opts.Split = oldContinue, oldSplit
 				return
 			}
-			rg.errCode = protocolErrorCode(firstErr)
-			rg.errMsg = firstErr.Error()
+			rg.setError(protocolErrorCode(firstErr), firstErr.Error())
 			return
 		}
 
 		if err := adaptor.Sync(); err != nil {
 			e.log.Error("file sync failed", "gid", rg.gid, "error", err)
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = err.Error()
+			rg.setError(core.ExitFileIOError, err.Error())
 			return
 		}
 
@@ -4572,20 +4537,20 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 				_ = adaptor.Close()
 				e.resetControlState(rg, outPath)
 				if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-					rg.errCode = core.ExitFileIOError
-					rg.errMsg = truncErr.Error()
+					rg.setError(core.ExitFileIOError, truncErr.Error())
 					return
 				}
 				e.runHTTPDownload(ctx, rg, uri, outPath)
 				return
 			}
-			rg.errCode = core.ExitChecksumError
-			rg.errMsg = verifyErr.Error()
+			rg.setError(core.ExitChecksumError, verifyErr.Error())
 			return
 		}
 		e.clearHTTPResumeFallbackURIs(rg)
 		rg.resumeFailureCount = 0
+		rg.statusMu.Lock()
 		rg.errCode = core.ExitSuccess
+		rg.statusMu.Unlock()
 		rg.numConnections.Store(int64(len(segMan.segments)))
 		e.applyHTTPRemoteTime(rg, outPath, lastModified)
 		e.log.Info("download complete", "gid", rg.gid, "size", rg.completedLength)
@@ -4603,8 +4568,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 	resp, err := e.downloadHTTPWithRetry(ctx, rg, driver, uri, offset, requestSize, requestOpts)
 	if errors.Is(err, httpproto.ErrRangeIgnored) && offset > 0 {
 		if rg.opts.AlwaysResume {
-			rg.errCode = core.ExitFileAlreadyExists
-			rg.errMsg = err.Error()
+			rg.setError(core.ExitFileAlreadyExists, err.Error())
 			return
 		}
 		if nextURI, restartScratch := e.nextHTTPResumeFallbackURI(rg, uri, 0); nextURI != "" {
@@ -4615,15 +4579,13 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			e.runHTTPDownload(ctx, rg, nextURI, outPath)
 			return
 		} else if !restartScratch {
-			rg.errCode = protocolErrorCode(err)
-			rg.errMsg = err.Error()
+			rg.setError(protocolErrorCode(err), err.Error())
 			return
 		}
 		e.clearHTTPResumeFallbackURIs(rg)
 		e.log.Warn("HTTP server ignored resume range; restarting from scratch", "gid", rg.gid, "path", outPath)
 		if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = truncErr.Error()
+			rg.setError(core.ExitFileIOError, truncErr.Error())
 			return
 		}
 		offset = 0
@@ -4636,14 +4598,12 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 	}
 	if err != nil {
 		e.log.Error("HTTP download failed", "gid", rg.gid, "uri", uri, "error", err)
-		rg.errCode = protocolErrorCode(err)
-		rg.errMsg = err.Error()
+		rg.setError(protocolErrorCode(err), err.Error())
 		return
 	}
 	if err := e.applyHTTPResponseDigests(rg, resp.Digests); err != nil {
 		resp.Body.Close()
-		rg.errCode = core.ExitChecksumError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitChecksumError, err.Error())
 		return
 	}
 
@@ -4656,8 +4616,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		e.initControlInfo(rg, outPath, 0, 0, nil)
 		f, fileErr := openHTTPScratchFile(outPath)
 		if fileErr != nil {
-			rg.errCode = core.ExitFileCreateError
-			rg.errMsg = fileErr.Error()
+			rg.setError(core.ExitFileCreateError, fileErr.Error())
 			return
 		}
 		host, _ := uriHostProto(uri)
@@ -4676,14 +4635,12 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		}
 		if syncErr != nil {
 			e.log.Error("file sync failed", "gid", rg.gid, "error", syncErr)
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = syncErr.Error()
+			rg.setError(core.ExitFileIOError, syncErr.Error())
 			return
 		}
 		if closeErr != nil {
 			e.log.Error("file close failed", "gid", rg.gid, "error", closeErr)
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = closeErr.Error()
+			rg.setError(core.ExitFileIOError, closeErr.Error())
 			return
 		}
 		rg.statusMu.Lock()
@@ -4693,20 +4650,20 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			if mode == "whole" && e.allowIntegrityRetry(rg) {
 				e.resetControlState(rg, outPath)
 				if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-					rg.errCode = core.ExitFileIOError
-					rg.errMsg = truncErr.Error()
+					rg.setError(core.ExitFileIOError, truncErr.Error())
 					return
 				}
 				e.runHTTPDownload(ctx, rg, uri, outPath)
 				return
 			}
-			rg.errCode = core.ExitChecksumError
-			rg.errMsg = verifyErr.Error()
+			rg.setError(core.ExitChecksumError, verifyErr.Error())
 			return
 		}
 		e.clearHTTPResumeFallbackURIs(rg)
 		rg.resumeFailureCount = 0
+		rg.statusMu.Lock()
 		rg.errCode = core.ExitSuccess
+		rg.statusMu.Unlock()
 		e.applyHTTPRemoteTime(rg, outPath, lastModified)
 		e.log.Info("download complete", "gid", rg.gid, "size", rg.completedLength)
 		return
@@ -4715,8 +4672,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 	adaptor, err := disk.NewSingleFile(outPath, size, alloc)
 	if err != nil {
 		e.log.Error("cannot create output file", "gid", rg.gid, "path", outPath, "error", err)
-		rg.errCode = core.ExitFileCreateError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileCreateError, err.Error())
 		return
 	}
 	e.setControlAdaptor(rg, adaptor)
@@ -4736,8 +4692,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 	}
 	if err := adaptor.Sync(); err != nil {
 		e.log.Error("file sync failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitFileIOError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileIOError, err.Error())
 		return
 	}
 
@@ -4755,20 +4710,20 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			_ = adaptor.Close()
 			e.resetControlState(rg, outPath)
 			if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-				rg.errCode = core.ExitFileIOError
-				rg.errMsg = truncErr.Error()
+				rg.setError(core.ExitFileIOError, truncErr.Error())
 				return
 			}
 			e.runHTTPDownload(ctx, rg, uri, outPath)
 			return
 		}
-		rg.errCode = core.ExitChecksumError
-		rg.errMsg = verifyErr.Error()
+		rg.setError(core.ExitChecksumError, verifyErr.Error())
 		return
 	}
 	e.clearHTTPResumeFallbackURIs(rg)
 	rg.resumeFailureCount = 0
+	rg.statusMu.Lock()
 	rg.errCode = core.ExitSuccess
+	rg.statusMu.Unlock()
 	e.applyHTTPRemoteTime(rg, outPath, lastModified)
 	e.log.Info("download complete", "gid", rg.gid, "size", rg.completedLength)
 }
@@ -5031,22 +4986,19 @@ func (e *Engine) downloadToAdaptor(ctx context.Context, rg *requestGroup, adapto
 			wn, writeErr := adaptor.WriteAt(buf[:n], writeOffset)
 			if writeErr != nil {
 				e.log.Error("disk write failed", "gid", rg.gid, "error", writeErr)
-				rg.errCode = core.ExitFileIOError
-				rg.errMsg = writeErr.Error()
+				rg.setError(core.ExitFileIOError, writeErr.Error())
 				return -1
 			}
 			written += int64(wn)
 			completedPieces := e.markControlWritten(rg, writeOffset, int64(wn))
 			atomic.AddInt64(&rg.bytesDownloaded, int64(wn))
 			if err := guard.Add(wn); err != nil {
-				rg.errCode = core.ExitTooSlow
-				rg.errMsg = err.Error()
+				rg.setError(core.ExitTooSlow, err.Error())
 				return -1
 			}
 			if rg.opts != nil && rg.opts.RealtimeChunkChecksum {
 				if err := e.verifyCompletedPieces(ctx, rg, adaptor, completedPieces); err != nil {
-					rg.errCode = core.ExitChecksumError
-					rg.errMsg = err.Error()
+					rg.setError(core.ExitChecksumError, err.Error())
 					return -1
 				}
 			}
@@ -5060,8 +5012,7 @@ func (e *Engine) downloadToAdaptor(ctx context.Context, rg *requestGroup, adapto
 				return -1
 			}
 			e.log.Error("read failed", "gid", rg.gid, "error", readErr)
-			rg.errCode = protocolErrorCode(readErr)
-			rg.errMsg = readErr.Error()
+			rg.setError(protocolErrorCode(readErr), readErr.Error())
 			return -1
 		}
 	}
@@ -5305,8 +5256,7 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 	conn, err := e.newFTPTransferConn(ctx, uri, u, host, ftpUser, ftpPass, rg.opts, rg.opts.FTPPasv)
 	if err != nil {
 		e.log.Error("FTP dial failed", "gid", rg.gid, "host", host, "error", err)
-		rg.errCode = core.ExitFTPProtocolError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFTPProtocolError, err.Error())
 		return
 	}
 	defer conn.Close()
@@ -5327,16 +5277,13 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 			size = 0
 		} else {
 			e.log.Error("FTP SIZE failed", "gid", rg.gid, "path", u.Path, "error", err)
-			rg.errCode = core.ExitFTPProtocolError
-			rg.errMsg = err.Error()
+			rg.setError(core.ExitFTPProtocolError, err.Error())
 			return
 		}
 	}
 
 	rg.statusMu.Lock()
 	rg.totalLength = size
-	rg.statusMu.Unlock()
-	rg.statusMu.Lock()
 	rg.lastSpeedSample = time.Now()
 	rg.statusMu.Unlock()
 	e.initControlInfo(rg, outPath, size, rg.integrity.controlPieceLength(0), nil)
@@ -5349,28 +5296,25 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 					if e.allowIntegrityRetry(rg) {
 						e.resetControlState(rg, outPath)
 						if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-							rg.errCode = core.ExitFileIOError
-							rg.errMsg = truncErr.Error()
+							rg.setError(core.ExitFileIOError, truncErr.Error())
 							return
 						}
 						offset = 0
 					} else {
-						rg.errCode = core.ExitChecksumError
-						rg.errMsg = verifyErr.Error()
+						rg.setError(core.ExitChecksumError, verifyErr.Error())
 						return
 					}
 				}
 				if offset >= size {
 					rg.statusMu.Lock()
 					rg.completedLength = size
-					rg.statusMu.Unlock()
 					rg.errCode = core.ExitSuccess
+					rg.statusMu.Unlock()
 					return
 				}
 			}
 		} else if statErr != nil && !os.IsNotExist(statErr) {
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = statErr.Error()
+			rg.setError(core.ExitFileIOError, statErr.Error())
 			return
 		}
 	}
@@ -5384,8 +5328,7 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 	adaptor, err := openTransferAdaptor(outPath, size, alloc)
 	if err != nil {
 		e.log.Error("cannot create output file", "gid", rg.gid, "path", outPath, "error", err)
-		rg.errCode = core.ExitFileCreateError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileCreateError, err.Error())
 		return
 	}
 	e.setControlAdaptor(rg, adaptor)
@@ -5400,8 +5343,7 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 	body, err := conn.Retrieve(ctx, u.Path, offset)
 	if err != nil {
 		e.log.Error("FTP RETR failed", "gid", rg.gid, "path", u.Path, "error", err)
-		rg.errCode = core.ExitFTPProtocolError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFTPProtocolError, err.Error())
 		return
 	}
 	bodyClosed := false
@@ -5423,15 +5365,13 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 	bodyClosed = true
 	if err := body.Close(); err != nil {
 		e.log.Error("FTP body close failed", "gid", rg.gid, "path", u.Path, "error", err)
-		rg.errCode = core.ExitFTPProtocolError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFTPProtocolError, err.Error())
 		return
 	}
 
 	if err := adaptor.Sync(); err != nil {
 		e.log.Error("file sync failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitFileIOError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileIOError, err.Error())
 		return
 	}
 
@@ -5443,18 +5383,18 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 			_ = adaptor.Close()
 			e.resetControlState(rg, outPath)
 			if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-				rg.errCode = core.ExitFileIOError
-				rg.errMsg = truncErr.Error()
+				rg.setError(core.ExitFileIOError, truncErr.Error())
 				return
 			}
 			e.runFTPDownload(ctx, rg, uri, u, outPath)
 			return
 		}
-		rg.errCode = core.ExitChecksumError
-		rg.errMsg = verifyErr.Error()
+		rg.setError(core.ExitChecksumError, verifyErr.Error())
 		return
 	}
+	rg.statusMu.Lock()
 	rg.errCode = core.ExitSuccess
+	rg.statusMu.Unlock()
 	e.applyHTTPRemoteTime(rg, outPath, lastModified)
 	e.log.Info("download complete", "gid", rg.gid, "size", rg.completedLength)
 }
@@ -5483,8 +5423,7 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	dialer, err := e.dialerForProtocol("sftp", host, rg.opts)
 	if err != nil {
 		e.log.Error("SFTP proxy setup failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitFTPProtocolError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFTPProtocolError, err.Error())
 		return
 	}
 	sess, err := sftpOpen(ctx, dialer, sftpproto.Opts{
@@ -5501,11 +5440,17 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	if err != nil {
 		e.log.Error("SFTP open failed", "gid", rg.gid, "host", host, "error", err)
 		if sftpproto.IsHostKeyDigestError(err) {
+			rg.statusMu.Lock()
 			rg.errCode = core.ExitUnknownError
+			rg.statusMu.Unlock()
 		} else {
+			rg.statusMu.Lock()
 			rg.errCode = core.ExitFTPProtocolError
+			rg.statusMu.Unlock()
 		}
+		rg.statusMu.Lock()
 		rg.errMsg = err.Error()
+		rg.statusMu.Unlock()
 		return
 	}
 	defer sess.Close()
@@ -5513,8 +5458,7 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	info, err := sess.Stat(ctx, u.Path)
 	if err != nil {
 		e.log.Error("SFTP stat failed", "gid", rg.gid, "path", u.Path, "error", err)
-		rg.errCode = core.ExitFTPProtocolError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFTPProtocolError, err.Error())
 		return
 	}
 
@@ -5522,8 +5466,6 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	lastModified := info.ModTime
 	rg.statusMu.Lock()
 	rg.totalLength = size
-	rg.statusMu.Unlock()
-	rg.statusMu.Lock()
 	rg.lastSpeedSample = time.Now()
 	rg.statusMu.Unlock()
 	e.initControlInfo(rg, outPath, size, rg.integrity.controlPieceLength(0), nil)
@@ -5536,28 +5478,25 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 					if e.allowIntegrityRetry(rg) {
 						e.resetControlState(rg, outPath)
 						if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-							rg.errCode = core.ExitFileIOError
-							rg.errMsg = truncErr.Error()
+							rg.setError(core.ExitFileIOError, truncErr.Error())
 							return
 						}
 						offset = 0
 					} else {
-						rg.errCode = core.ExitChecksumError
-						rg.errMsg = verifyErr.Error()
+						rg.setError(core.ExitChecksumError, verifyErr.Error())
 						return
 					}
 				}
 				if offset >= size {
 					rg.statusMu.Lock()
 					rg.completedLength = size
-					rg.statusMu.Unlock()
 					rg.errCode = core.ExitSuccess
+					rg.statusMu.Unlock()
 					return
 				}
 			}
 		} else if statErr != nil && !os.IsNotExist(statErr) {
-			rg.errCode = core.ExitFileIOError
-			rg.errMsg = statErr.Error()
+			rg.setError(core.ExitFileIOError, statErr.Error())
 			return
 		}
 	}
@@ -5571,8 +5510,7 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	adaptor, err := openTransferAdaptor(outPath, size, alloc)
 	if err != nil {
 		e.log.Error("cannot create output file", "gid", rg.gid, "path", outPath, "error", err)
-		rg.errCode = core.ExitFileCreateError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileCreateError, err.Error())
 		return
 	}
 	e.setControlAdaptor(rg, adaptor)
@@ -5583,8 +5521,7 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	reader, err := sess.OpenFile(ctx, u.Path, offset)
 	if err != nil {
 		e.log.Error("SFTP open file failed", "gid", rg.gid, "path", u.Path, "error", err)
-		rg.errCode = core.ExitFTPProtocolError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFTPProtocolError, err.Error())
 		return
 	}
 	readerClosed := false
@@ -5607,15 +5544,13 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	readerClosed = true
 	if err := reader.Close(); err != nil {
 		e.log.Error("SFTP reader close failed", "gid", rg.gid, "path", u.Path, "error", err)
-		rg.errCode = core.ExitFTPProtocolError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFTPProtocolError, err.Error())
 		return
 	}
 
 	if err := adaptor.Sync(); err != nil {
 		e.log.Error("file sync failed", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitFileIOError
-		rg.errMsg = err.Error()
+		rg.setError(core.ExitFileIOError, err.Error())
 		return
 	}
 
@@ -5627,18 +5562,18 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 			_ = adaptor.Close()
 			e.resetControlState(rg, outPath)
 			if truncErr := os.Truncate(outPath, 0); truncErr != nil {
-				rg.errCode = core.ExitFileIOError
-				rg.errMsg = truncErr.Error()
+				rg.setError(core.ExitFileIOError, truncErr.Error())
 				return
 			}
 			e.runSFTPDownload(ctx, rg, uri, u, outPath)
 			return
 		}
-		rg.errCode = core.ExitChecksumError
-		rg.errMsg = verifyErr.Error()
+		rg.setError(core.ExitChecksumError, verifyErr.Error())
 		return
 	}
+	rg.statusMu.Lock()
 	rg.errCode = core.ExitSuccess
+	rg.statusMu.Unlock()
 	e.applyHTTPRemoteTime(rg, outPath, lastModified)
 	e.log.Info("download complete", "gid", rg.gid, "size", rg.completedLength)
 }
@@ -5651,8 +5586,7 @@ func (e *Engine) runMetalinkDownload(ctx context.Context, rg *requestGroup, meta
 	entries, err := metalinkDownloadEntries(metalinkData, rg.opts)
 	if err != nil {
 		e.log.Error("cannot parse metalink", "gid", rg.gid, "error", err)
-		rg.errCode = core.ExitResourceNotFound
-		rg.errMsg = fmt.Sprintf("invalid metalink: %v", err)
+		rg.setError(core.ExitResourceNotFound, fmt.Sprintf("invalid metalink: %v", err))
 		return
 	}
 	if len(entries) == 0 && len(rg.uris) > 0 {
@@ -5662,8 +5596,7 @@ func (e *Engine) runMetalinkDownload(ctx context.Context, rg *requestGroup, meta
 	}
 	if len(entries) == 0 {
 		e.log.Error("metalink download has no fallback URIs", "gid", rg.gid)
-		rg.errCode = core.ExitResourceNotFound
-		rg.errMsg = "no URIs in metalink"
+		rg.setError(core.ExitResourceNotFound, "no URIs in metalink")
 		return
 	}
 
@@ -5690,16 +5623,14 @@ func (e *Engine) runMetalinkDownload(ctx context.Context, rg *requestGroup, meta
 			rg.totalLength = entry.Size
 			rg.statusMu.Unlock()
 		}
-		rg.errCode = 0
-		rg.errMsg = ""
+		rg.setError(0, "")
 		if i > 0 {
 			e.log.Warn("metalink mirror failed; trying next", "gid", rg.gid, "uri", entry.URI, "attempt", i+1, "mirrors", len(entries))
 		}
 		e.runMetalinkEntry(ctx, rg, entry)
 		if rg.errCode == core.ExitSuccess {
 			if code, msg := verifyMetalinkDownload(ctx, rg.filePath, entry); code != core.ExitSuccess {
-				rg.errCode = code
-				rg.errMsg = msg
+				rg.setError(code, msg)
 			}
 			return
 		}
@@ -5709,14 +5640,12 @@ func (e *Engine) runMetalinkDownload(ctx context.Context, rg *requestGroup, meta
 		}
 	}
 	if lastErrCode != 0 {
-		rg.errCode = lastErrCode
-		rg.errMsg = lastErrMsg
+		rg.setError(lastErrCode, lastErrMsg)
 		return
 	}
 
 	e.log.Error("metalink download exhausted all mirrors", "gid", rg.gid)
-	rg.errCode = core.ExitResourceNotFound
-	rg.errMsg = "no usable URIs in metalink"
+	rg.setError(core.ExitResourceNotFound, "no usable URIs in metalink")
 }
 
 func (e *Engine) runMetalinkEntry(ctx context.Context, rg *requestGroup, entry metalinkDownloadEntry) {
@@ -5724,8 +5653,7 @@ func (e *Engine) runMetalinkEntry(ctx context.Context, rg *requestGroup, entry m
 	u, errParse := url.Parse(uri)
 	if errParse != nil {
 		e.log.Error("cannot parse URI", "gid", rg.gid, "uri", uri, "error", errParse)
-		rg.errCode = core.ExitResourceNotFound
-		rg.errMsg = fmt.Sprintf("invalid URI: %s", uri)
+		rg.setError(core.ExitResourceNotFound, fmt.Sprintf("invalid URI: %s", uri))
 		return
 	}
 
@@ -5739,8 +5667,7 @@ func (e *Engine) runMetalinkEntry(ctx context.Context, rg *requestGroup, entry m
 		e.runSFTPDownload(ctx, rg, uri, u, rg.filePath)
 	default:
 		e.log.Error("unsupported protocol in metalink", "gid", rg.gid, "protocol", proto)
-		rg.errCode = core.ExitResourceNotFound
-		rg.errMsg = fmt.Sprintf("unsupported protocol: %s", proto)
+		rg.setError(core.ExitResourceNotFound, fmt.Sprintf("unsupported protocol: %s", proto))
 	}
 }
 
@@ -6097,7 +6024,8 @@ func (e *Engine) downloadFTPSegment(ctx context.Context, host, path, user, pass 
 	guard := newSpeedGuard(parseSize(rg.opts.LowestSpeedLimit), time.Duration(parseInt(rg.opts.StartupIdleTime))*time.Second, hostOnly)
 	written := e.downloadToAdaptor(ctx, rg, adaptor, body, seg.Start, guard)
 	if written < 0 {
-		return -1, fmt.Errorf("%s: %s", rg.errCode, rg.errMsg)
+		code, msg := rg.errorStatus()
+		return -1, fmt.Errorf("%s: %s", code, msg)
 	}
 	if !bodyClosed {
 		bodyClosed = true
