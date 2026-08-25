@@ -24,6 +24,11 @@ import (
 // invalid and every valid GID is greater than zero.
 type GID = core.GID
 
+// ParseGID parses a GID from its decimal or 16-character lowercase hex form.
+func ParseGID(s string) (GID, error) {
+	return core.ParseGID(s)
+}
+
 // ErrDownloadNotFound reports a GID the engine no longer knows, e.g. after
 // a queued download is cancelled or its stopped-result entry is evicted.
 var ErrDownloadNotFound = engine.ErrDownloadNotFound

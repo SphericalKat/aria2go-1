@@ -423,3 +423,50 @@ func TestAddMetalink_Concurrent(t *testing.T) {
 		t.Errorf("Waiting = %d, want 10", st.Waiting)
 	}
 }
+
+func TestParseGID(t *testing.T) {
+	gid, err := ParseGID("0000000000000001")
+	if err != nil {
+		t.Fatalf("ParseGID(hex) error = %v", err)
+	}
+	if gid != 1 {
+		t.Errorf("ParseGID(hex) = %d, want 1", gid)
+	}
+
+	gid, err = ParseGID("42")
+	if err != nil {
+		t.Fatalf("ParseGID(decimal) error = %v", err)
+	}
+	if gid != 42 {
+		t.Errorf("ParseGID(decimal) = %d, want 42", gid)
+	}
+
+	if _, err := ParseGID("zz"); err == nil {
+		t.Error("expected error for invalid GID")
+	}
+}
+
+func TestGIDRoundTrip(t *testing.T) {
+	d, err := New(Config{Engine: testEngineOptions(t)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	gid, err := d.AddURI("http://example.com/file.iso", nil)
+	if err != nil {
+		t.Fatalf("AddURI() error = %v", err)
+	}
+	parsed, err := ParseGID(gid.Hex())
+	if err != nil {
+		t.Fatalf("ParseGID(Hex()) error = %v", err)
+	}
+	if parsed != gid {
+		t.Errorf("round trip = %s, want %s", parsed, gid)
+	}
+	st, err := d.TellStatus(parsed)
+	if err != nil {
+		t.Fatalf("TellStatus(parsed) error = %v", err)
+	}
+	if st.GID != gid {
+		t.Errorf("status GID = %s, want %s", st.GID, gid)
+	}
+}
