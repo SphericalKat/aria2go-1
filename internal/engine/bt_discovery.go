@@ -619,8 +619,7 @@ func markBTCanceled(rg *requestGroup) {
 	if rg == nil {
 		return
 	}
-	rg.errCode = core.ExitRemoved
-	rg.errMsg = "download cancelled"
+	rg.setError(core.ExitRemoved, "download cancelled")
 }
 
 func completedFromBytes(rg *requestGroup) int64 {

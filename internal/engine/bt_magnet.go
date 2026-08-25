@@ -541,7 +541,7 @@ func (e *Engine) runMagnetMetadataSession(ctx context.Context, rg *requestGroup,
 		return core.NewError(core.ExitResourceNotFound, "no peers available")
 	}
 
-	rg.numConnections = len(peers)
+	rg.numConnections.Store(int64(len(peers)))
 
 	session := newMagnetMetadataSession(*m.InfoHashV1, peers)
 	msgCh := make(chan magnetMetadataEnvelope, len(peers)*4)
@@ -568,7 +568,7 @@ func (e *Engine) runMagnetMetadataSession(ctx context.Context, rg *requestGroup,
 				if env.err != nil && !errors.Is(env.err, context.Canceled) && !errors.Is(env.err, btpeer.ErrPeerClosed) {
 					e.log.Debug("BT metadata peer closed", "gid", rg.gid, "addr", env.peer.addr, "error", env.err)
 				}
-				rg.numConnections = activeMetadataPeers(session.peers)
+				rg.numConnections.Store(int64(activeMetadataPeers(session.peers)))
 				if session.allPeersClosed() {
 					return core.NewError(core.ExitResourceNotFound, "no peers available")
 				}
@@ -598,7 +598,9 @@ func (e *Engine) runMagnetMetadataSession(ctx context.Context, rg *requestGroup,
 						env.peer.conn.Close()
 						continue
 					}
+					rg.statusMu.Lock()
 					rg.totalLength = int64(hs.MetadataSize)
+					rg.statusMu.Unlock()
 					e.assignMetadataRequests(session, rg)
 					continue
 				}
@@ -618,7 +620,9 @@ func (e *Engine) runMagnetMetadataSession(ctx context.Context, rg *requestGroup,
 						env.peer.conn.Close()
 						continue
 					}
+					rg.statusMu.Lock()
 					rg.completedLength = int64(metadataCompletedBytes(session))
+					rg.statusMu.Unlock()
 					if metadata != nil {
 						cancel()
 						for _, peer := range peers {
@@ -634,7 +638,9 @@ func (e *Engine) runMagnetMetadataSession(ctx context.Context, rg *requestGroup,
 		case <-ticker.C:
 			session.expireTimedOutRequests(time.Now())
 			e.assignMetadataRequests(session, rg)
+			rg.statusMu.Lock()
 			rg.completedLength = int64(metadataCompletedBytes(session))
+			rg.statusMu.Unlock()
 		}
 	}
 }
@@ -690,9 +696,13 @@ func (e *Engine) finishMagnetMetadata(rg *requestGroup, m *magnet.Magnet, metada
 		return err
 	}
 
+	rg.statusMu.Lock()
 	rg.followedBy = append(rg.followedBy, childGID)
+	rg.statusMu.Unlock()
 	if child, ok := e.groups.getLocked(childGID); ok {
+		child.statusMu.Lock()
 		child.following = rg.gid
+		child.statusMu.Unlock()
 		e.groups.unlock(childGID)
 	}
 

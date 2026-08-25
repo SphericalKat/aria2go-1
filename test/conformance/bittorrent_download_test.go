@@ -3,9 +3,12 @@ package conformance
 import (
 	"bytes"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/smartass08/aria2go/internal/bencode"
 )
@@ -111,4 +114,45 @@ func protocolTorrentSingleFileWithURLList(announce, name string, data []byte, pi
 		top.Set("url-list", bencode.NewList(values...))
 	}
 	return bencode.Marshal(top)
+}
+
+func TestBitTorrent_FollowTorrentURLParity(t *testing.T) {
+	SkipIfNoRef(t)
+
+	payload := protocolPayload("bittorrent-follow-torrent-url-parity", 32*1024+123)
+	const (
+		name        = "bt-follow.bin"
+		pieceLength = 16 * 1024
+	)
+
+	refBT := startProtocolBTFixture(t, name, payload, pieceLength)
+	implBT := startProtocolBTFixture(t, name, payload, pieceLength)
+
+	refTorrentSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "payload.torrent", time.Now(), bytes.NewReader(refBT.TorrentData))
+	}))
+	defer refTorrentSrv.Close()
+	implTorrentSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "payload.torrent", time.Now(), bytes.NewReader(implBT.TorrentData))
+	}))
+	defer implTorrentSrv.Close()
+
+	refDir := t.TempDir()
+	implDir := t.TempDir()
+	followArgs := func(dir, torrentURL string) []string {
+		args := bittorrentDownloadArgs(dir, torrentURL)
+		// The .torrent file is saved next to the payload; avoid the
+		// ref/impl sharing one directory.
+		args = append(args[:len(args)-1], "--bt-save-metadata=false", torrentURL)
+		return args
+	}
+
+	ref := protocolRun(t, true, followArgs(refDir, refTorrentSrv.URL+"/payload.torrent"))
+	impl := protocolRun(t, false, followArgs(implDir, implTorrentSrv.URL+"/payload.torrent"))
+
+	AssertEqualExit(t, ref, impl)
+	protocolRequireExitZero(t, "ref follow-torrent", ref)
+	protocolRequireExitZero(t, "impl follow-torrent", impl)
+	protocolRequireFile(t, filepath.Join(refDir, name), payload)
+	protocolRequireFile(t, filepath.Join(implDir, name), payload)
 }

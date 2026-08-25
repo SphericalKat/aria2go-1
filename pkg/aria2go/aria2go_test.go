@@ -6,8 +6,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/smartass08/aria2go/internal/config"
 )
 
 const testMetalinkV4 = `<?xml version="1.0" encoding="UTF-8"?>
@@ -28,15 +26,36 @@ const testMetalinkMultiFile = `<?xml version="1.0" encoding="UTF-8"?>
   </file>
 </metalink>`
 
-func testOpts() *config.Options {
-	cfg := config.Default()
-	cfg.Dir = "/tmp/aria2go-test"
-	cfg.MaxConcurrentDownloads = 5
-	cfg.MaxDownloadResult = 100
-	cfg.EnableDHT = false
-	cfg.RPCListenPort = 0
-	cfg.DryRun = true
-	return cfg
+func testEngineOptions(t *testing.T) *EngineOptions {
+	t.Helper()
+	return &EngineOptions{
+		Dir:                    t.TempDir(),
+		MaxConcurrentDownloads: 5,
+		DryRun:                 true,
+	}
+}
+
+func runDaemon(t *testing.T, opts *EngineOptions) (*Daemon, context.CancelFunc) {
+	t.Helper()
+	d, err := New(Config{Engine: opts})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = d.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("Run did not return after context cancel")
+		}
+	})
+	return d, cancel
 }
 
 func TestNew(t *testing.T) {
@@ -47,27 +66,21 @@ func TestNew(t *testing.T) {
 	if d == nil {
 		t.Fatal("New() returned nil")
 	}
-	if d.eng == nil {
-		t.Fatal("Daemon engine is nil")
-	}
-	if d.cfg == nil {
-		t.Fatal("Daemon config is nil")
-	}
 }
 
-func TestNew_WithOptions(t *testing.T) {
-	opts := testOpts()
-	d, err := New(Config{Options: opts})
+func TestNew_WithEngineOptions(t *testing.T) {
+	opts := &EngineOptions{Dir: "/tmp/aria2go-engine-test", MaxConcurrentDownloads: 3}
+	d, err := New(Config{Engine: opts})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if d.cfg.Dir != opts.Dir {
-		t.Errorf("Dir = %q, want %q", d.cfg.Dir, opts.Dir)
+	if d == nil {
+		t.Fatal("New() returned nil")
 	}
 }
 
 func TestAddURI(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -87,7 +100,7 @@ func TestAddURI(t *testing.T) {
 }
 
 func TestAddTorrent(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -102,7 +115,7 @@ func TestAddTorrent(t *testing.T) {
 }
 
 func TestAddMetalink(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -120,7 +133,7 @@ func TestAddMetalink(t *testing.T) {
 }
 
 func TestAddMetalink_MultiFileReturnsMultipleGIDs(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -141,7 +154,7 @@ func TestAddMetalink_MultiFileReturnsMultipleGIDs(t *testing.T) {
 }
 
 func TestAddMetalink_InvalidXML(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -157,83 +170,23 @@ func TestRPCAddr_Disabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-
-	addr := d.RPCAddr()
-	if addr != "" {
-		t.Errorf("RPCAddr() = %q, want empty (RPC disabled)", addr)
+	if addr := d.RPCAddr(); addr != "" {
+		t.Errorf("RPCAddr() = %q, want empty", addr)
 	}
 }
 
-func TestRPCAddr_Enabled(t *testing.T) {
-	d, err := New(Config{
-		Options: &config.Options{
-			EnableRPC:     true,
-			RPCListenPort: 6800,
-		},
-	})
+func TestTellStatus_UnknownGID(t *testing.T) {
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-
-	addr := d.RPCAddr()
-	if addr != "http://127.0.0.1:6800/jsonrpc" {
-		t.Errorf("RPCAddr() = %q, want http://127.0.0.1:6800/jsonrpc", addr)
-	}
-}
-
-func TestRPCAddr_CustomPort(t *testing.T) {
-	d, err := New(Config{
-		Options: &config.Options{
-			EnableRPC:     true,
-			RPCListenPort: 6999,
-		},
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	addr := d.RPCAddr()
-	if addr != "http://127.0.0.1:6999/jsonrpc" {
-		t.Errorf("RPCAddr() = %q, want http://127.0.0.1:6999/jsonrpc", addr)
-	}
-}
-
-func TestRPCAddr_ListenAll(t *testing.T) {
-	d, err := New(Config{
-		Options: &config.Options{
-			EnableRPC:     true,
-			RPCListenPort: 6800,
-			RPCListenAll:  true,
-		},
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	addr := d.RPCAddr()
-	if addr != "http://0.0.0.0:6800/jsonrpc" {
-		t.Errorf("RPCAddr() = %q, want http://0.0.0.0:6800/jsonrpc", addr)
-	}
-}
-
-func TestRPCAddr_DefaultPort(t *testing.T) {
-	d, err := New(Config{
-		Options: &config.Options{
-			EnableRPC: true,
-		},
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	addr := d.RPCAddr()
-	if addr != "http://127.0.0.1:6800/jsonrpc" {
-		t.Errorf("RPCAddr() = %q, want http://127.0.0.1:6800/jsonrpc (default port)", addr)
+	if _, err := d.TellStatus(GID(1)); err == nil {
+		t.Error("expected error for unknown GID")
 	}
 }
 
 func TestShutdown(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -263,7 +216,7 @@ func TestShutdown(t *testing.T) {
 }
 
 func TestShutdown_Force(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -280,7 +233,7 @@ func TestShutdown_Force(t *testing.T) {
 }
 
 func TestShutdown_DoubleCall(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -298,7 +251,7 @@ func TestShutdown_DoubleCall(t *testing.T) {
 }
 
 func TestShutdown_Concurrent(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -309,14 +262,14 @@ func TestShutdown_Concurrent(t *testing.T) {
 	go d.Run(ctx)
 	time.Sleep(10 * time.Millisecond)
 
-	// Add downloads before shutdown
 	for i := 0; i < 10; i++ {
-		d.AddURI("http://example.com/"+string(rune('a'+i%26)), nil)
+		if _, err := d.AddURI("http://example.com/"+string(rune('a'+i%26)), nil); err != nil {
+			t.Fatalf("AddURI() error = %v", err)
+		}
 	}
 
 	var wg sync.WaitGroup
 
-	// Concurrent shutdown calls
 	var shutdownErrors int32
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
@@ -328,7 +281,6 @@ func TestShutdown_Concurrent(t *testing.T) {
 		}()
 	}
 
-	// Concurrent status reads during shutdown
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func() {
@@ -337,7 +289,6 @@ func TestShutdown_Concurrent(t *testing.T) {
 		}()
 	}
 
-	// Concurrent AddURI during shutdown (should fail gracefully)
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -348,43 +299,34 @@ func TestShutdown_Concurrent(t *testing.T) {
 
 	wg.Wait()
 
-	// At least 4 of 5 concurrent shutdowns should have been rejected (only first succeeds).
 	if shutdownErrors < 3 {
 		t.Errorf("expected most concurrent shutdowns to fail, got %d failures out of 5", shutdownErrors)
 	}
 }
 
 func TestStatus(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	// No downloads yet.
 	st := d.Status()
-	if st.Active != 0 {
-		t.Errorf("Active = %d, want 0", st.Active)
-	}
-	if st.Waiting != 0 {
-		t.Errorf("Waiting = %d, want 0", st.Waiting)
-	}
-	if st.Stopped != 0 {
-		t.Errorf("Stopped = %d, want 0", st.Stopped)
-	}
-	if st.Speed != 0 {
-		t.Errorf("Speed = %d, want 0", st.Speed)
+	if st.Active != 0 || st.Waiting != 0 || st.Stopped != 0 || st.Speed != 0 {
+		t.Errorf("Status() = %+v, want all zero", st)
 	}
 }
 
 func TestStatus_WithDownloads(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	d.AddURI("http://example.com/a", nil)
-	d.AddURI("http://example.com/b", nil)
-	d.AddURI("http://example.com/c", nil)
+	for _, name := range []string{"a", "b", "c"} {
+		if _, err := d.AddURI("http://example.com/"+name, nil); err != nil {
+			t.Fatalf("AddURI() error = %v", err)
+		}
+	}
 
 	st := d.Status()
 	if st.Waiting != 3 {
@@ -396,12 +338,14 @@ func TestStatus_WithDownloads(t *testing.T) {
 }
 
 func TestStatus_Concurrent(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	d.AddURI("http://example.com/file.iso", nil)
+	if _, err := d.AddURI("http://example.com/file.iso", nil); err != nil {
+		t.Fatalf("AddURI() error = %v", err)
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -415,7 +359,7 @@ func TestStatus_Concurrent(t *testing.T) {
 }
 
 func TestAddURI_Concurrent(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -435,8 +379,7 @@ func TestAddURI_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := d.AddURI("http://example.com/"+string(rune('a'+i%26)), nil)
-			if err != nil {
+			if _, err := d.AddURI("http://example.com/"+string(rune('a'+i%26)), nil); err != nil {
 				t.Errorf("AddURI concurrent error: %v", err)
 			}
 		}(i)
@@ -453,12 +396,12 @@ func TestAddURI_Concurrent(t *testing.T) {
 
 	st := d.Status()
 	if st.Stopped != 20 {
-		t.Errorf("Stopped = %d, want 20 (dry-run + onEndOfRun)", st.Stopped)
+		t.Errorf("Stopped = %d, want 20 (dry-run completes)", st.Stopped)
 	}
 }
 
 func TestAddMetalink_Concurrent(t *testing.T) {
-	d, err := New(Config{Options: testOpts()})
+	d, err := New(Config{Engine: testEngineOptions(t)})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -468,8 +411,7 @@ func TestAddMetalink_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := d.AddMetalink([]byte(testMetalinkV4), nil)
-			if err != nil {
+			if _, err := d.AddMetalink([]byte(testMetalinkV4), nil); err != nil {
 				t.Errorf("AddMetalink concurrent error: %v", err)
 			}
 		}()

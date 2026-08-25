@@ -202,8 +202,8 @@ func (s *btSwarm) seedCount() int {
 }
 
 func (s *btSwarm) updateStats(rg *requestGroup) {
-	rg.numConnections = s.peerCount()
-	rg.numSeeders = s.seedCount()
+	rg.numConnections.Store(int64(s.peerCount()))
+	rg.numSeeders.Store(int64(s.seedCount()))
 }
 
 func (s *btSwarm) canAcceptMorePeers(limit int) bool {
@@ -735,7 +735,9 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 		}
 		wantedPieces = pieceFilter
 		rg.btUnselected = append(rg.btUnselected[:0], unselected...)
+		rg.statusMu.Lock()
 		rg.fileEntries = append(rg.fileEntries[:0], files...)
+		rg.statusMu.Unlock()
 		mf, aErr := disk.NewMultiFile(dir, files, meta.Info.PieceLength, alloc)
 		if aErr != nil {
 			e.log.Error("BT disk setup failed", "gid", rg.gid, "error", aErr)
@@ -760,12 +762,14 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 			rg.errMsg = aErr.Error()
 			return aErr
 		}
+		rg.statusMu.Lock()
 		rg.fileEntries = []disk.FileEntry{{
 			Name:      outPath,
 			Length:    meta.Info.Length,
 			Offset:    0,
 			Requested: true,
 		}}
+		rg.statusMu.Unlock()
 		adaptor = sf
 	}
 
@@ -958,8 +962,10 @@ func (e *Engine) runBTDownload(ctx context.Context, rg *requestGroup, torrentDat
 		completeCancel()
 	}
 
+	rg.statusMu.Lock()
 	rg.seeder = true
 	rg.errCode = core.ExitSuccess
+	rg.statusMu.Unlock()
 	e.log.Info("BT download complete, entering seeding", "gid", rg.gid)
 	e.emit(core.EvBTComplete, rg.gid)
 
@@ -1013,8 +1019,7 @@ func (s *btSwarm) downloadLoop(ctx context.Context, rg *requestGroup, e *Engine,
 		select {
 		case <-ctx.Done():
 			wg.Wait()
-			rg.errCode = core.ExitRemoved
-			rg.errMsg = "download cancelled"
+			rg.setError(core.ExitRemoved, "download cancelled")
 			return ctx.Err()
 
 		case peer := <-newPeers:
@@ -1077,8 +1082,7 @@ func (s *btSwarm) seedLoop(ctx context.Context, rg *requestGroup, e *Engine, new
 		case <-ctx.Done():
 			s.closeAll()
 			wg.Wait()
-			rg.errCode = core.ExitRemoved
-			rg.errMsg = "download cancelled"
+			rg.setError(core.ExitRemoved, "download cancelled")
 			return ctx.Err()
 
 		case peer := <-newPeers:
@@ -1123,8 +1127,7 @@ func (s *btSwarm) downloadWebSeeds(ctx context.Context, rg *requestGroup, e *Eng
 		}
 		select {
 		case <-ctx.Done():
-			rg.errCode = core.ExitRemoved
-			rg.errMsg = "download cancelled"
+			rg.setError(core.ExitRemoved, "download cancelled")
 			return ctx.Err()
 		default:
 		}

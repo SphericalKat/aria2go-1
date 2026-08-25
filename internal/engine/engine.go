@@ -105,17 +105,22 @@ type requestGroup struct {
 	controlPieceBytes []int64
 	adaptor           disk.Adaptor
 	controlMu         sync.Mutex
-	probed            bool
-	probedSize        int64
-	acceptsRanges     bool
-	inflatedResponse  bool
-	cdFilename        string
-	lastModified      time.Time
+	// statusMu guards completion fields that worker goroutines write
+	// without the group lock and makeStatus reads: errCode, errMsg,
+	// followedBy, following, seeder.
+	statusMu         sync.Mutex
+	probed           bool
+	probedSize       int64
+	acceptsRanges    bool
+	inflatedResponse bool
+	cdFilename       string
+	lastModified     time.Time
+	contentType      string
 
 	completedLength    int64
 	totalLength        int64
-	numConnections     int
-	numSeeders         int
+	numConnections     atomic.Int64
+	numSeeders         atomic.Int64
 	fileName           string
 	resumeFailureCount int
 	bytesDownloaded    int64
@@ -1102,6 +1107,13 @@ func (e *Engine) Shutdown(force bool) error {
 	return nil
 }
 
+// KeepRunning configures the engine to keep running when no downloads remain,
+// matching aria2's keepRunning_ behavior with --enable-rpc. Library embeddings
+// that manage the engine lifecycle through Run's context call this before Run.
+func (e *Engine) KeepRunning() {
+	e.keepRunning = true
+}
+
 func (e *Engine) markActiveShutdown(force bool) {
 	e.queuesMu.Lock()
 	for _, gid := range e.active {
@@ -1401,7 +1413,7 @@ func (e *Engine) Remove(gid core.GID, force bool) error {
 	rg, ok := e.groups.getLocked(gid)
 	if !ok {
 		e.queuesMu.Unlock()
-		return fmt.Errorf("engine: download GID#%s not found", gid)
+		return fmt.Errorf("%w: GID#%s", ErrDownloadNotFound, gid)
 	}
 
 	rg.haltRequested = true
@@ -1556,6 +1568,9 @@ func (e *Engine) ExitCode() core.ErrorCode {
 }
 
 // TellStatus returns the current status of a single download.
+// ErrDownloadNotFound reports an unknown GID passed to TellStatus or Remove.
+var ErrDownloadNotFound = errors.New("engine: download not found")
+
 func (e *Engine) TellStatus(gid core.GID) (*Status, error) {
 	rg, ok := e.groups.getLocked(gid)
 	if ok {
@@ -1566,7 +1581,7 @@ func (e *Engine) TellStatus(gid core.GID) (*Status, error) {
 
 	dr, found := e.stoppedRing.getByGID(gid)
 	if !found {
-		return nil, fmt.Errorf("engine: download GID#%s not found", gid)
+		return nil, fmt.Errorf("%w: GID#%s", ErrDownloadNotFound, gid)
 	}
 	status := cloneStatusSnapshot(dr.statusSnapshot)
 	return &status, nil
@@ -2976,13 +2991,26 @@ func (e *Engine) refreshStats() {
 		now := time.Now()
 		elapsed := now.Sub(rg.lastSpeedSample)
 
+		// A worker that already cancelled its transfer context has
+		// assigned the final completed/uploaded lengths. Counting its
+		// remaining byte counters again would double-report the final
+		// sample, so drop it instead. The group stays in the active
+		// queue until removeStoppedGroup reaps it.
+		transferDone := rg.ctx != nil && rg.ctx.Err() != nil
+
 		if elapsed > 0 {
 			// Download Speed EMA
 			dlInstant := int64(0)
 			if rg.bytesDownloaded > 0 {
 				dlInstant = int64(float64(rg.bytesDownloaded) / elapsed.Seconds())
-				rg.completedLength += rg.bytesDownloaded
-				rg.bytesDownloaded = 0
+				if transferDone {
+					rg.bytesDownloaded = 0
+				} else {
+					rg.statusMu.Lock()
+					rg.completedLength += rg.bytesDownloaded
+					rg.statusMu.Unlock()
+					rg.bytesDownloaded = 0
+				}
 			}
 			prevDL := rg.downloadSpeed
 			smoothedDL := int64(emaAlpha*float64(dlInstant) + (1-emaAlpha)*float64(prevDL))
@@ -3007,7 +3035,9 @@ func (e *Engine) refreshStats() {
 			totalUL += smoothedUL
 		}
 
+		rg.statusMu.Lock()
 		rg.lastSpeedSample = now
+		rg.statusMu.Unlock()
 		e.groups.unlock(gid)
 	}
 
@@ -3131,12 +3161,12 @@ func (e *Engine) removeStoppedGroup() {
 				e.addStoppedLocked(rg, core.StatusRemoved, core.ExitRemoved, "")
 			default:
 				errCode := core.ExitInProgress
-				if rg.errCode != 0 && rg.errCode != core.ExitSuccess {
-					errCode = rg.errCode
+				if code, _ := rg.errorStatus(); code != 0 && code != core.ExitSuccess {
+					errCode = code
 				}
-				errMsg := rg.errMsg
-				if errCode == core.ExitInProgress {
-					errMsg = ""
+				errMsg := ""
+				if errCode != core.ExitInProgress {
+					_, errMsg = rg.errorStatus()
 				}
 				e.addStoppedLocked(rg, core.StatusError, errCode, errMsg)
 			}
@@ -3145,15 +3175,16 @@ func (e *Engine) removeStoppedGroup() {
 			continue
 		} else {
 			// Completed or error — add to stopped results.
+			code, msg := rg.errorStatus()
 			errCode := core.ExitSuccess
-			if rg.errCode != 0 {
-				errCode = rg.errCode
+			if code != 0 {
+				errCode = code
 			}
 			finalState := core.StatusComplete
 			if errCode != core.ExitSuccess {
 				finalState = core.StatusError
 			}
-			e.addStoppedLocked(rg, finalState, errCode, rg.errMsg)
+			e.addStoppedLocked(rg, finalState, errCode, msg)
 			e.groups.unlock(gid)
 			e.groups.delete(gid)
 			continue
@@ -3329,10 +3360,11 @@ func (e *Engine) onEndOfRun() {
 			// Graceful shutdown: mark as IN_PROGRESS so they can be
 			// resumed on restart (matches aria2's SHUTDOWN_SIGNAL halt reason).
 			errCode := core.ExitInProgress
-			if rg.errCode != 0 && rg.errCode != core.ExitSuccess {
-				errCode = rg.errCode
+			errMsg := ""
+			if code, msg := rg.errorStatus(); code != 0 && code != core.ExitSuccess {
+				errCode = code
+				errMsg = msg
 			}
-			errMsg := rg.errMsg
 			if errCode == core.ExitInProgress {
 				errMsg = ""
 				e.shutdownExitPending.Store(true)
@@ -3392,8 +3424,7 @@ func (e *Engine) moveFromWaitingLocked(gid core.GID) {
 // Caller must hold the shard lock for rg.gid.
 func (e *Engine) addStoppedLocked(rg *requestGroup, state core.Status, errCode core.ErrorCode, errMsg string) {
 	rg.state = state
-	rg.errCode = errCode
-	rg.errMsg = errMsg
+	rg.setError(errCode, errMsg)
 
 	dr := drPool.Get().(*downloadResult)
 	dr.gid = rg.gid
@@ -3538,9 +3569,13 @@ func (e *Engine) runDownload(rg *requestGroup) {
 	if len(selectedURIs) > 0 {
 		uri = selectedURIs[0]
 	}
+	rg.statusMu.Lock()
 	rg.uriUsed = true
+	rg.statusMu.Unlock()
 	host, _ := uriHostProto(uri)
+	rg.statusMu.Lock()
 	rg.activeURI = uri
+	rg.statusMu.Unlock()
 	if host != "" {
 		rg.activeHosts = map[string]int{host: 1}
 	} else {
@@ -3607,6 +3642,11 @@ func (e *Engine) runDownload(rg *requestGroup) {
 
 	switch proto {
 	case "http", "https":
+		if e.shouldFollowTorrent(rg, uri) {
+			e.runTorrentFollowDownload(ctx, rg, uri, outPath)
+			rg.cancel()
+			return
+		}
 		e.runHTTPDownload(ctx, rg, uri, outPath)
 	case "ftp":
 		e.runFTPDownload(ctx, rg, uri, u, outPath)
@@ -3732,6 +3772,7 @@ func (e *Engine) prepareHTTPMetadata(ctx context.Context, rg *requestGroup, uri,
 	rg.inflatedResponse = info.Inflated
 	rg.cdFilename = info.ContentDispositionFilename
 	rg.lastModified = info.LastModified
+	rg.contentType = info.ContentType
 
 	if !outPathExplicit && info.ContentDispositionFilename != "" {
 		outPath = httpContentDispositionPath(rg.opts, info.ContentDispositionFilename)
@@ -3939,8 +3980,12 @@ func (e *Engine) completeHTTPNotModified(rg *requestGroup, outPath string) {
 	rg.filePath = outPath
 	rg.fileName = filepath.Base(outPath)
 	rg.filePathFromURI = false
+	rg.statusMu.Lock()
 	rg.totalLength = st.Size()
+	rg.statusMu.Unlock()
+	rg.statusMu.Lock()
 	rg.completedLength = st.Size()
+	rg.statusMu.Unlock()
 	rg.errCode = core.ExitSuccess
 	e.log.Info("HTTP resource not modified", "gid", rg.gid, "path", outPath)
 }
@@ -4063,31 +4108,44 @@ func openHTTPScratchFile(outPath string) (*os.File, error) {
 	return os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 }
 
+// setError writes the error code and message under statusMu. Worker
+// goroutines call this after their context is cancelled, concurrent with
+// the reaper's final write in addStoppedLocked and status polls.
+func (rg *requestGroup) setError(code core.ErrorCode, msg string) {
+	rg.statusMu.Lock()
+	rg.errCode = code
+	rg.errMsg = msg
+	rg.statusMu.Unlock()
+}
+
+// errorStatus reads the error code and message under statusMu.
+func (rg *requestGroup) errorStatus() (core.ErrorCode, string) {
+	rg.statusMu.Lock()
+	defer rg.statusMu.Unlock()
+	return rg.errCode, rg.errMsg
+}
+
 func markTransferCanceled(rg *requestGroup) {
 	if rg == nil {
 		return
 	}
 	switch rg.haltReason {
 	case haltReasonUserRequest:
-		rg.errCode = core.ExitRemoved
-		rg.errMsg = ""
+		rg.setError(core.ExitRemoved, "")
 		return
 	case haltReasonShutdown:
 		if rg.haltRequested && !rg.forceHaltReq {
 			// Mirrors aria2's SHUTDOWN_SIGNAL path: graceful halt leaves
 			// lastErrorCode undefined so the final DownloadResult becomes IN_PROGRESS.
-			rg.errCode = 0
-			rg.errMsg = ""
+			rg.setError(0, "")
 			return
 		}
 	}
 	if rg.haltRequested && !rg.forceHaltReq {
-		rg.errCode = 0
-		rg.errMsg = ""
+		rg.setError(0, "")
 		return
 	}
-	rg.errCode = core.ExitRemoved
-	rg.errMsg = "download cancelled"
+	rg.setError(core.ExitRemoved, "download cancelled")
 }
 
 func (e *Engine) downloadToFile(ctx context.Context, rg *requestGroup, f *os.File, body io.Reader, guard *speedGuard) int64 {
@@ -4158,7 +4216,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			return
 		}
 		if rg.errCode == core.ExitSuccess {
-			e.recordServerStatSuccess(recordURI, max64(rg.downloadSpeed, downloadAverageSpeed(rg)), max(1, rg.numConnections))
+			e.recordServerStatSuccess(recordURI, max64(rg.downloadSpeed, downloadAverageSpeed(rg)), max(1, int(rg.numConnections.Load())))
 			return
 		}
 		if rg.errCode != 0 {
@@ -4198,8 +4256,12 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		e.log.Info("Content-Disposition filename", "gid", rg.gid, "filename", cdFilename)
 	}
 
+	rg.statusMu.Lock()
 	rg.totalLength = size
+	rg.statusMu.Unlock()
+	rg.statusMu.Lock()
 	rg.lastSpeedSample = time.Now()
+	rg.statusMu.Unlock()
 	e.initControlInfo(rg, outPath, size, rg.integrity.controlPieceLength(0), nil)
 	existingSize := int64(0)
 	if inflated {
@@ -4223,7 +4285,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 				}
 			}
 			if existingSize >= size {
+				rg.statusMu.Lock()
 				rg.completedLength = size
+				rg.statusMu.Unlock()
 				rg.errCode = core.ExitSuccess
 				e.applyHTTPRemoteTime(rg, outPath, lastModified)
 				e.log.Info("download already complete", "gid", rg.gid, "size", size)
@@ -4250,7 +4314,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 					}
 				}
 				if existingSize >= size {
+					rg.statusMu.Lock()
 					rg.completedLength = size
+					rg.statusMu.Unlock()
 					rg.errCode = core.ExitSuccess
 					e.applyHTTPRemoteTime(rg, outPath, lastModified)
 					e.log.Info("download already complete", "gid", rg.gid, "size", size)
@@ -4285,7 +4351,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 	if len(selectedURIs) == 0 {
 		selectedURIs = []string{uri}
 	}
+	rg.statusMu.Lock()
 	rg.activeURI = selectedURIs[0]
+	rg.statusMu.Unlock()
 	rg.activeHosts = hostUseMap(selectedURIs)
 	startupIdle := time.Duration(parseInt(rg.opts.StartupIdleTime)) * time.Second
 	lowestLimit := e.effectiveLowestSpeedLimit(rg, selectedURIs)
@@ -4313,7 +4381,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			segMan = newResumeSegmentMan(size, split, minSplitSize, existingSize)
 		}
 		if segMan.Done() {
+			rg.statusMu.Lock()
 			rg.completedLength = size
+			rg.statusMu.Unlock()
 			if mode, bad, verifyErr := e.verifyIntegrity(ctx, rg, adaptor, outPath); verifyErr != nil {
 				if mode == "piece" && len(bad) > 0 && e.allowIntegrityRetry(rg) {
 					_ = adaptor.Close()
@@ -4330,7 +4400,7 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			e.log.Info("download already complete", "gid", rg.gid, "size", size)
 			return
 		}
-		rg.numConnections = len(selectedURIs)
+		rg.numConnections.Store(int64(len(selectedURIs)))
 
 		segmentCtx, segmentCancel := context.WithCancel(ctx)
 		defer segmentCancel()
@@ -4441,7 +4511,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 						rg.errMsg = closeErr.Error()
 						return
 					}
+					rg.statusMu.Lock()
 					rg.activeURI = nextURI
+					rg.statusMu.Unlock()
 					e.runHTTPDownload(ctx, rg, nextURI, outPath)
 					return
 				} else if !restartScratch {
@@ -4481,9 +4553,13 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			return
 		}
 
+		rg.statusMu.Lock()
 		rg.completedLength = baseCompleted + segMan.Written()
+		rg.statusMu.Unlock()
 		if size > 0 && rg.completedLength > size {
+			rg.statusMu.Lock()
 			rg.completedLength = size
+			rg.statusMu.Unlock()
 		}
 		if mode, bad, verifyErr := e.verifyIntegrity(ctx, rg, adaptor, outPath); verifyErr != nil {
 			if mode == "piece" && len(bad) > 0 && e.allowIntegrityRetry(rg) {
@@ -4510,14 +4586,14 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		e.clearHTTPResumeFallbackURIs(rg)
 		rg.resumeFailureCount = 0
 		rg.errCode = core.ExitSuccess
-		rg.numConnections = len(segMan.segments)
+		rg.numConnections.Store(int64(len(segMan.segments)))
 		e.applyHTTPRemoteTime(rg, outPath, lastModified)
 		e.log.Info("download complete", "gid", rg.gid, "size", rg.completedLength)
 		return
 	}
 
 	// Single-connection path (split <= 1 or unknown size).
-	rg.numConnections = 1
+	rg.numConnections.Store(1)
 
 	offset := existingSize
 	requestSize := int64(0)
@@ -4533,7 +4609,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		}
 		if nextURI, restartScratch := e.nextHTTPResumeFallbackURI(rg, uri, 0); nextURI != "" {
 			recordURI = ""
+			rg.statusMu.Lock()
 			rg.activeURI = nextURI
+			rg.statusMu.Unlock()
 			e.runHTTPDownload(ctx, rg, nextURI, outPath)
 			return
 		} else if !restartScratch {
@@ -4572,7 +4650,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 	defer resp.Body.Close()
 
 	if size <= 0 || resp.Inflated {
+		rg.statusMu.Lock()
 		rg.totalLength = 0
+		rg.statusMu.Unlock()
 		e.initControlInfo(rg, outPath, 0, 0, nil)
 		f, fileErr := openHTTPScratchFile(outPath)
 		if fileErr != nil {
@@ -4606,7 +4686,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 			rg.errMsg = closeErr.Error()
 			return
 		}
+		rg.statusMu.Lock()
 		rg.completedLength = written
+		rg.statusMu.Unlock()
 		if mode, _, verifyErr := e.verifyIntegrity(ctx, rg, nil, outPath); verifyErr != nil {
 			if mode == "whole" && e.allowIntegrityRetry(rg) {
 				e.resetControlState(rg, outPath)
@@ -4659,7 +4741,9 @@ func (e *Engine) runHTTPDownload(ctx context.Context, rg *requestGroup, uri, out
 		return
 	}
 
+	rg.statusMu.Lock()
 	rg.completedLength = offset + written
+	rg.statusMu.Unlock()
 	if mode, bad, verifyErr := e.verifyIntegrity(ctx, rg, adaptor, outPath); verifyErr != nil {
 		if mode == "piece" && len(bad) > 0 && acceptsRanges && e.allowIntegrityRetry(rg) {
 			_ = adaptor.Close()
@@ -5208,7 +5292,7 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 	}
 	defer func() {
 		if rg.errCode == core.ExitSuccess {
-			e.recordServerStatSuccess(uri, max64(rg.downloadSpeed, downloadAverageSpeed(rg)), max(1, rg.numConnections))
+			e.recordServerStatSuccess(uri, max64(rg.downloadSpeed, downloadAverageSpeed(rg)), max(1, int(rg.numConnections.Load())))
 			return
 		}
 		if rg.errCode != 0 {
@@ -5249,8 +5333,12 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 		}
 	}
 
+	rg.statusMu.Lock()
 	rg.totalLength = size
+	rg.statusMu.Unlock()
+	rg.statusMu.Lock()
 	rg.lastSpeedSample = time.Now()
+	rg.statusMu.Unlock()
 	e.initControlInfo(rg, outPath, size, rg.integrity.controlPieceLength(0), nil)
 	offset := e.controlResumeOffset(rg, outPath)
 	if offset == 0 && rg.opts.Continue {
@@ -5273,7 +5361,9 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 					}
 				}
 				if offset >= size {
+					rg.statusMu.Lock()
 					rg.completedLength = size
+					rg.statusMu.Unlock()
 					rg.errCode = core.ExitSuccess
 					return
 				}
@@ -5305,7 +5395,7 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 	guard := newSpeedGuard(parseSize(rg.opts.LowestSpeedLimit), time.Duration(parseInt(rg.opts.StartupIdleTime))*time.Second, hostOnly)
 
 	// Single-connection path.
-	rg.numConnections = 1
+	rg.numConnections.Store(1)
 
 	body, err := conn.Retrieve(ctx, u.Path, offset)
 	if err != nil {
@@ -5345,7 +5435,9 @@ func (e *Engine) runFTPDownload(ctx context.Context, rg *requestGroup, uri strin
 		return
 	}
 
+	rg.statusMu.Lock()
 	rg.completedLength = offset + written
+	rg.statusMu.Unlock()
 	if mode, _, verifyErr := e.verifyIntegrity(ctx, rg, adaptor, outPath); verifyErr != nil {
 		if mode == "whole" && e.allowIntegrityRetry(rg) {
 			_ = adaptor.Close()
@@ -5378,7 +5470,7 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 	}
 	defer func() {
 		if rg.errCode == core.ExitSuccess {
-			e.recordServerStatSuccess(uri, max64(rg.downloadSpeed, downloadAverageSpeed(rg)), max(1, rg.numConnections))
+			e.recordServerStatSuccess(uri, max64(rg.downloadSpeed, downloadAverageSpeed(rg)), max(1, int(rg.numConnections.Load())))
 			return
 		}
 		if rg.errCode != 0 {
@@ -5428,8 +5520,12 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 
 	size := info.Size
 	lastModified := info.ModTime
+	rg.statusMu.Lock()
 	rg.totalLength = size
+	rg.statusMu.Unlock()
+	rg.statusMu.Lock()
 	rg.lastSpeedSample = time.Now()
+	rg.statusMu.Unlock()
 	e.initControlInfo(rg, outPath, size, rg.integrity.controlPieceLength(0), nil)
 	offset := e.controlResumeOffset(rg, outPath)
 	if offset == 0 && rg.opts.Continue {
@@ -5452,7 +5548,9 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 					}
 				}
 				if offset >= size {
+					rg.statusMu.Lock()
 					rg.completedLength = size
+					rg.statusMu.Unlock()
 					rg.errCode = core.ExitSuccess
 					return
 				}
@@ -5496,7 +5594,7 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 		}
 	}()
 
-	rg.numConnections = 1
+	rg.numConnections.Store(1)
 	written := e.downloadToAdaptor(ctx, rg, adaptor, reader, offset, guard)
 	if written < 0 {
 		if e.shouldRetryRealtimePieceCheck(rg) {
@@ -5521,7 +5619,9 @@ func (e *Engine) runSFTPDownload(ctx context.Context, rg *requestGroup, uri stri
 		return
 	}
 
+	rg.statusMu.Lock()
 	rg.completedLength = offset + written
+	rg.statusMu.Unlock()
 	if mode, _, verifyErr := e.verifyIntegrity(ctx, rg, adaptor, outPath); verifyErr != nil {
 		if mode == "whole" && e.allowIntegrityRetry(rg) {
 			_ = adaptor.Close()
@@ -5575,7 +5675,9 @@ func (e *Engine) runMetalinkDownload(ctx context.Context, rg *requestGroup, meta
 		rg.fileName = filepath.Base(entry.Name)
 	}
 	if entry.SizeKnown {
+		rg.statusMu.Lock()
 		rg.totalLength = entry.Size
+		rg.statusMu.Unlock()
 	}
 
 	var (
@@ -5584,7 +5686,9 @@ func (e *Engine) runMetalinkDownload(ctx context.Context, rg *requestGroup, meta
 	)
 	for i, entry := range entries {
 		if entry.SizeKnown {
+			rg.statusMu.Lock()
 			rg.totalLength = entry.Size
+			rg.statusMu.Unlock()
 		}
 		rg.errCode = 0
 		rg.errMsg = ""

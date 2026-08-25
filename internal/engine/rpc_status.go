@@ -317,6 +317,11 @@ func (e *Engine) makeStatus(rg *requestGroup) *Status {
 		st = core.StatusPaused
 	}
 
+	// Worker goroutines publish progress and completion state without the
+	// group lock, so snapshot the whole status under the status mutex.
+	rg.statusMu.Lock()
+	defer rg.statusMu.Unlock()
+
 	info, bitfield := e.statusControlSnapshot(rg)
 	totalLength := rg.totalLength
 	uploadLength := int64(0)
@@ -354,8 +359,8 @@ func (e *Engine) makeStatus(rg *requestGroup) *Status {
 		DownloadSpeed:   rg.downloadSpeed,
 		UploadSpeed:     rg.uploadSpeed,
 		InfoHash:        infoHash,
-		NumSeeders:      int64(rg.numSeeders),
-		Connections:     rg.numConnections,
+		NumSeeders:      rg.numSeeders.Load(),
+		Connections:     int(rg.numConnections.Load()),
 		ErrorCode:       rg.errCode,
 		ErrorMessage:    rg.errMsg,
 		FollowedBy:      append([]core.GID(nil), rg.followedBy...),

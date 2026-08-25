@@ -68,6 +68,7 @@ type ResourceInfo struct {
 	AcceptsRanges              bool
 	Inflated                   bool
 	ContentDispositionFilename string
+	ContentType                string
 	LastModified               time.Time
 	Digests                    []ResponseDigest
 }
@@ -952,6 +953,7 @@ func (d *Driver) responseResourceInfo(resp *http.Response) ResourceInfo {
 		AcceptsRanges:              strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes"),
 		Inflated:                   d.shouldInflateContentEncoding(resp),
 		ContentDispositionFilename: contentDispositionFilename(resp, d.contentDispositionDefaultUTF8),
+		ContentType:                resp.Header.Get("Content-Type"),
 		LastModified:               lastModifiedTime(resp),
 		Digests:                    parseResponseDigests(resp),
 	}
